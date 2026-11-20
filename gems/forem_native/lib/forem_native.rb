@@ -7,10 +7,10 @@ require_relative "forem_native/builder"
 # In production, CI, and local development, it loads either the platform-compiled
 # shared library (`forem_native/forem_native.{so,bundle}` from `Containerfile` /
 # `rake forem_native:compile`) or the committed precompiled platform binary
-# (`forem_native/{arm64-darwin,x86_64-darwin,x86_64-linux}/forem_native.{so,bundle}`),
+# (`forem_native/{arm64-darwin,x86_64-darwin,x86_64-linux,aarch64-linux}/forem_native.{so,bundle}`),
 # and automatically compiles via `cargo` on first load if neither is staged yet.
 module ForemNative
-  LATEST_NATIVE_SYMBOL = :image_convert_to_png_checked
+  LATEST_NATIVE_SYMBOL = :ahoy_decorate_payload
   PROFILE_AVATAR_PALETTE_KEYS = %i[bg halo sparkle shadow body shirt trim accent cheek].freeze
   PROFILE_AVATAR_STYLE_KEYS = %i[
     backdrop outfit arm head topper eyes accessory cheeks mouth
@@ -757,6 +757,13 @@ module ForemNative
       Native.scrub_agent_session_messages(messages)&.sort_by { |_, count| -count }
     end
 
+    # Counts per-message redactions in first-seen order, or returns nil for Ruby coercion.
+    def aggregate_transcript_redactions(messages)
+      return unless Native.respond_to?(:aggregate_transcript_redactions) && messages.instance_of?(Array)
+
+      Native.aggregate_transcript_redactions(messages)
+    end
+
     # Adds `"js-code-highlight"` to every `div.highlight` element on canonical HTML fragments,
     # matching `Html::Parser#add_control_class_to_codeblock`.
     def add_control_class_to_codeblock(html)
@@ -839,6 +846,67 @@ module ForemNative
       return unless html.instance_of?(String) && html.encoding == Encoding::UTF_8
 
       Native.extract_mentioned_usernames(html)
+    end
+
+    # Scrubs unsafe `href`/`src` URIs and adds `target="_blank"` + `rel="noopener noreferrer"`
+    # to outbound `a[href^="http"]` links outside `app_domain` on canonical HTML fragments,
+    # matching `MarkdownProcessor::Parser#add_target_blank_to_outbound_links`.
+    def add_target_blank_to_outbound_links(html, app_domain)
+      return unless Native.respond_to?(:add_target_blank_to_outbound_links)
+      return unless html.instance_of?(String) && html.encoding == Encoding::UTF_8
+      return unless app_domain.is_a?(String)
+
+      Native.add_target_blank_to_outbound_links(html, app_domain.to_s)
+    end
+
+    # Removes `<br>` elements directly nested inside `<ul>`, `<ol>`, or `<li>` on canonical
+    # HTML fragments.
+    def remove_nested_linebreak_in_list_fragment(html)
+      return unless Native.respond_to?(:remove_nested_linebreak_in_list_fragment)
+      return unless html.instance_of?(String) && html.encoding == Encoding::UTF_8
+
+      Native.remove_nested_linebreak_in_list_fragment(html)
+    end
+
+    # Enforces GIF-like attributes on `<video>` elements on canonical HTML fragments, matching
+    # `Html::Parser#enforce_gif_like_videos`.
+    def enforce_gif_like_videos(html)
+      return unless Native.respond_to?(:enforce_gif_like_videos)
+      return unless html.instance_of?(String) && html.encoding == Encoding::UTF_8
+
+      Native.enforce_gif_like_videos(html)
+    end
+
+    # Inserts `action_html` into `div.highlight__panel` elements on canonical HTML fragments,
+    # matching `Html::Parser#add_fullscreen_button_to_panel`.
+    def add_fullscreen_button_to_panel(html, action_html)
+      return unless Native.respond_to?(:add_fullscreen_button_to_panel)
+      return unless html.instance_of?(String) && html.encoding == Encoding::UTF_8
+      return unless action_html.instance_of?(String) && action_html.encoding == Encoding::UTF_8
+
+      Native.add_fullscreen_button_to_panel(html, action_html)
+    end
+
+    # Single-FFI HTML post-processing pipeline combining outbound link tagging, list `<br>`
+    # cleanup, image link wrapping, `<video>` normalization, fused codeblock enhancements,
+    # table wrapping, empty `<p>` pruning, colon-emoji replacement, raw-tag unescaping,
+    # `@mention` linking, and optional `Nokogiri::HTML` `body.inner_html` newline normalization.
+    def postprocess_rendered_html(html, app_domain:, fullscreen_action_html: "", existing_usernames: [],
+                                  base_url: "", run_target_blank: true, normalize_document: true)
+      return unless Native.respond_to?(:postprocess_rendered_html)
+      return unless html.instance_of?(String) && html.encoding == Encoding::UTF_8
+      return unless app_domain.is_a?(String) && fullscreen_action_html.is_a?(String)
+      return unless existing_usernames.is_a?(Array) && base_url.is_a?(String)
+
+      Native.postprocess_rendered_html(
+        html,
+        app_domain.to_s,
+        fullscreen_action_html.to_s,
+        existing_usernames,
+        base_url.to_s,
+        run_target_blank ? true : false,
+        normalize_document ? true : false,
+      )
     end
 
     # Renders the day links of the `calendar/_calendar_widget` month grid in one pass, matching
@@ -1070,6 +1138,46 @@ module ForemNative
       return unless Native.respond_to?(:validate_and_normalize_feed_events) && events.is_a?(Array)
 
       Native.validate_and_normalize_feed_events(events)
+    end
+
+    # Builds the deduplicated PostgreSQL tuple `IN (...)` predicate for `FeedEvents::BulkUpsert`
+    # timebox lookups without `Array#join` or `sanitize_sql_array` allocations.
+    def feed_events_timebox_lookup_sql(events)
+      return unless Native.respond_to?(:feed_events_timebox_lookup_sql) && events.is_a?(Array)
+
+      Native.feed_events_timebox_lookup_sql(events)
+    end
+
+    # Deduplicates candidate `FeedEvent` Hashes against existing timebox tuples and earlier
+    # batch entries in a single Rust pass, eliminating nested Ruby `Hash`/`Array` allocations.
+    def deduplicate_feed_events(events, existing_tuples)
+      return unless Native.respond_to?(:deduplicate_feed_events) &&
+        events.is_a?(Array) && existing_tuples.is_a?(Array)
+
+      Native.deduplicate_feed_events(events, existing_tuples)
+    end
+
+    # Computes `FeedEvent.article_freshness_multiplier` from UTC epoch float timestamps and
+    # `lookback_days` setting in pure Rust.
+    def article_freshness_multiplier(published_at_epoch, event_time_epoch, lookback_days)
+      return unless Native.respond_to?(:article_freshness_multiplier) && lookback_days.is_a?(Integer)
+      return unless (published_at_epoch.nil? || published_at_epoch.is_a?(Numeric)) &&
+        (event_time_epoch.nil? || event_time_epoch.is_a?(Numeric))
+
+      Native.article_freshness_multiplier(
+        published_at_epoch&.to_f,
+        event_time_epoch&.to_f,
+        lookback_days,
+      )
+    end
+
+    # Aggregates `[impressions_total, score, impression_users]` (or `[0, 0.0]` when no
+    # impressions) for `FeedEvent.calculate_feed_config_counters` in a single Rust pass.
+    def aggregate_feed_config_counters(rows, lookback_days)
+      return unless Native.respond_to?(:aggregate_feed_config_counters) &&
+        rows.is_a?(Array) && lookback_days.is_a?(Integer)
+
+      Native.aggregate_feed_config_counters(rows, lookback_days)
     end
 
     # Parses a `POST /bb_tabulations` JSON payload and builds the `BillboardEvent` `INSERT` SQL
@@ -1695,6 +1803,53 @@ module ForemNative
         custom_background ? true : false,
         font_path&.to_s,
       )
+    end
+
+    # Computes `AhoyEmail::Utils.signature(token:, campaign:, url:)` on the stack with zero
+    # intermediate Base64 or OpenSSL allocations.
+    def ahoy_signature(secret_token, token, campaign, url)
+      return unless Native.respond_to?(:ahoy_signature)
+      return unless secret_token.is_a?(String) && !secret_token.empty?
+
+      Native.ahoy_signature(secret_token, token.to_s, campaign.to_s, url.to_s)
+    end
+
+    # Classifies and rewrites a single URL for Ahoy email click tracking.
+    # Returns the decorated String, `false` when guaranteed unchanged/skipped, or `nil` when
+    # the input falls outside the strict fast-path domain and should defer to Ruby.
+    def ahoy_decorate_url(href, app_domain, token, campaign, secret_token, external_base_url = nil)
+      return unless Native.respond_to?(:ahoy_decorate_url)
+      return unless href.instance_of?(String) && app_domain.is_a?(String) &&
+        token.is_a?(String) && secret_token.is_a?(String) && !secret_token.empty?
+      return unless campaign.nil? || campaign.is_a?(String)
+      return unless external_base_url.nil? || external_base_url.is_a?(String)
+
+      Native.ahoy_decorate_url(href, app_domain, token, campaign, secret_token, external_base_url)
+    end
+
+    # Single-pass streaming `<a href>` rewriter for email HTML fragments, honoring
+    # `data-skip-click` and `&amp;` unescaping without constructing a Nokogiri DOM.
+    # Returns `nil` when the fragment falls outside the fast-path domain.
+    def ahoy_decorate_html(html, app_domain, token, campaign, secret_token, external_base_url = nil)
+      return unless Native.respond_to?(:ahoy_decorate_html)
+      return unless html.instance_of?(String) && app_domain.is_a?(String) &&
+        token.is_a?(String) && secret_token.is_a?(String) && !secret_token.empty?
+      return unless campaign.nil? || campaign.is_a?(String)
+      return unless external_base_url.nil? || external_base_url.is_a?(String)
+
+      Native.ahoy_decorate_html(html, app_domain, token, campaign, secret_token, external_base_url)
+    end
+
+    # Single-FFI-crossing recursive decorator for Customer.io `message_data` Hash/Array/String
+    # payloads. Returns untouched Ruby Strings by reference and `nil` on out-of-domain values.
+    def ahoy_decorate_payload(payload, app_domain, token, campaign, secret_token, external_base_url = nil)
+      return unless Native.respond_to?(:ahoy_decorate_payload)
+      return unless app_domain.is_a?(String) && token.is_a?(String) &&
+        secret_token.is_a?(String) && !secret_token.empty?
+      return unless campaign.nil? || campaign.is_a?(String)
+      return unless external_base_url.nil? || external_base_url.is_a?(String)
+
+      Native.ahoy_decorate_payload(payload, app_domain, token, campaign, secret_token, external_base_url)
     end
 
     private

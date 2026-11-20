@@ -336,6 +336,7 @@ class User < ApplicationRecord
   after_commit :bust_profile_details_cache, on: :update, if: :profile_details_changed_for_cache?
   after_commit :bust_profile_image_cache, on: :update, if: :profile_image_changed_for_cache?
   after_commit :enqueue_profile_spam_check, on: :update, if: :name_contains_spam_trigger_terms?
+  after_commit :revoke_auth_tokens_on_password_change, on: :update, if: :saved_change_to_encrypted_password?
 
   def self.average_articles_count
     Rails.cache.fetch("established_user_article_count", expires_in: 1.day) do
@@ -405,19 +406,18 @@ class User < ApplicationRecord
     self.remember_created_at ||= Time.now.utc
   end
 
-  def set_initial_roles!
+  # Read `first_user` before saving the new user: on a fresh database the
+  # setting falls back to `!User.exists?`, which is false once this user exists.
+  # The value is only a hint; Users::ClaimFirstUser re-checks it under a lock
+  # so that at most one signup gets the first-user roles.
+  def set_initial_roles!(first_user: Settings::General.waiting_on_first_user)
     # Avoid overwriting roles for users who already exist but are e.g. logging in
     # through a new identity provider
     return unless valid? && previously_new_record?
+    return if first_user && Users::ClaimFirstUser.call(self)
 
-    if Settings::General.waiting_on_first_user
-      add_role(:creator)
-      add_role(:super_admin)
-      add_role(:trusted)
-    elsif Settings::Authentication.limit_new_users?
-      add_role(:limited)
-      # Otherwise just leave the new user in good standing
-    end
+    # Otherwise just leave the new user in good standing
+    add_role(:limited) if Settings::Authentication.limit_new_users?
   end
 
   def author_trust_score
@@ -695,6 +695,7 @@ class User < ApplicationRecord
     :podcast_admin_for?,
     :restricted_liquid_tag_for?,
     :single_resource_admin_for?,
+    :sub_permission?,
     :subforem_moderator?,
     :super_admin?,
     :support_admin?,
@@ -1397,5 +1398,9 @@ class User < ApplicationRecord
       embed_page.user = self
       embed_page.update!(slug: new_slug)
     end
+  end
+
+  def revoke_auth_tokens_on_password_change
+    Authentication::AuthToken.revoke_for_user!(id)
   end
 end

@@ -130,7 +130,12 @@ class ApplicationController < ActionController::Base
   #
   # @raise [ActiveRecord::RecordNotFound] when called
   def not_found
-    if request.env["forem.custom_domain_org"].present?
+    if (org = request.env["forem.custom_domain_org"]).present?
+      # These redirects inherit the action's edge-cache headers. Tag them with the org key, which
+      # EdgeCache::BustArticle purges whenever an org article changes, so a redirect cached while a
+      # post was a draft (or before it existed) doesn't outlive its publication.
+      set_surrogate_key_header(org.record_key)
+
       redirect_rule = RequestRedirect.find_by(
         request_domain: request.host&.downcase,
         original_url: request.fullpath
@@ -447,15 +452,15 @@ class ApplicationController < ActionController::Base
   end
 
   def current_user_by_token
-    auth_header = request.headers["Authorization"]
-    return unless auth_header.present? && auth_header.start_with?("Bearer ")
+    token = Authentication::AuthToken.extract_bearer_token(request.headers["Authorization"])
+    return unless token
 
-    token = auth_header.split.last
     payload = decode_auth_token(token)
     return unless payload && payload["user_id"]
+    return if payload["purpose"] == Authentication::AuthToken::AUTH_PASS_PURPOSE
 
     user = User.find_by(id: payload["user_id"])
-    return unless user
+    return unless user && Authentication::AuthToken.valid_for_user?(payload, user)
 
     @current_user = user
     @token_authenticated = true

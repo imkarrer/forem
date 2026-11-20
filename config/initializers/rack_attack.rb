@@ -9,10 +9,15 @@ module Rack
   class Attack
     ADMIN_API_CACHE_KEY = "rack_attack_admin_api_keys".freeze
     ADMIN_ROLES = %w[admin super_admin tech_admin].freeze
+    API_PATH_REGEX = %r{\A(?:/locale/[^/]+)?/api/}
     API_SEARCH_PATH_REGEX = %r{
       \A(?:/locale/[^/]+)?/api/(?:v\d+/)?
       (?:(?:articles|users|concepts)/(?:semantic_)?search|related_articles)(?:\.json)?\z
     }x
+    API_USERS_PATH_REGEX = %r{\A(?:/locale/[^/]+)?/api/(?:v\d+/)?users(?:/|\.[^/.?]+|\z)}
+    SEARCH_PATH_REGEX = %r{\A(?:/locale/[^/]+)?/search(?:/|\.[^/.?]+|\z)}
+    SEARCH_PAGE_PATH_REGEX = %r{\A(?:/locale/[^/]+)?/search(?:\.[^/.?]+)?\z}
+    NEW_ARTICLE_PATH_REGEX = %r{\A(?:/locale/[^/]+)?/new(?:/[^/]+)?(?:\.[^/.?]+)?\z}
     MAGIC_LINK_CREATE_PATH_REGEX = %r{\A(?:/locale/[^/]+)?/magic_links(?:\.[^/.?]+)?\z}
     MAGIC_LINK_SHOW_PATH_REGEX = %r{\A(?:/locale/[^/]+)?/magic_links/(?!new(?:\.[^/.?]+)?\z)[^/]+\z}
 
@@ -57,12 +62,32 @@ module Rack
         end
       end
 
+      def api_write?
+        (put? || patch? || post? || delete?) && normalized_path.match?(API_PATH_REGEX)
+      end
+
+      def api_users_read?
+        (get? || head?) && normalized_path.match?(API_USERS_PATH_REGEX)
+      end
+
+      def search_endpoint?
+        normalized_path.match?(SEARCH_PATH_REGEX)
+      end
+
+      def search_page?
+        normalized_path.match?(SEARCH_PAGE_PATH_REGEX)
+      end
+
+      def new_article_page?
+        (get? || head?) && normalized_path.match?(NEW_ARTICLE_PATH_REGEX)
+      end
+
       def magic_link_create?
-        post? && magic_link_path.match?(MAGIC_LINK_CREATE_PATH_REGEX)
+        post? && normalized_path.match?(MAGIC_LINK_CREATE_PATH_REGEX)
       end
 
       def magic_link_show?
-        magic_link_path.match?(MAGIC_LINK_SHOW_PATH_REGEX)
+        normalized_path.match?(MAGIC_LINK_SHOW_PATH_REGEX)
       end
 
       # Rails params, not Rack's: they differ on query/body conflicts and JSON
@@ -73,20 +98,26 @@ module Rack
 
       private
 
-      # The router collapses slashes before matching, so `//magic_links` still routes.
-      def magic_link_path
+      # The router collapses slashes before matching, so `//magic_links` and `//api/pages` still route.
+      def normalized_path
         ActionDispatch::Journey::Router::Utils.normalize_path(path)
       end
     end
 
     throttle("search_throttle", limit: 4, period: 1) do |request|
-      if request.path.starts_with?("/search/") && !user_signed_in?(request)
+      if request.search_endpoint? && !user_signed_in?(request)
         request.track_and_return_ip
       end
     end
 
     throttle("search_throttle_signed_in", limit: 20, period: 1) do |request|
-      if request.path.starts_with?("/search/") && user_signed_in?(request)
+      if request.search_endpoint? && user_signed_in?(request)
+        request.track_and_return_ip
+      end
+    end
+
+    throttle("search_page_throttle_per_minute", limit: 30, period: 1.minute) do |request|
+      if request.search_page? && !user_signed_in?(request)
         request.track_and_return_ip
       end
     end
@@ -140,8 +171,7 @@ module Rack
     end
 
     throttle("api_write_throttle", limit: 1, period: 1) do |request|
-      api_endpoint = request.path.starts_with?("/api/")
-      if api_endpoint && (request.put? || request.post? || request.delete?)
+      if request.api_write?
         Honeycomb.add_field("user_api_key", request.env["HTTP_API_KEY"])
         unless admin_api_key?(request)
           request.track_and_return_ip
@@ -150,11 +180,8 @@ module Rack
     end
 
     throttle("api_write_key_throttle", limit: 1, period: 1) do |request|
-      api_endpoint = request.path.starts_with?("/api/")
-      if api_endpoint && (request.put? || request.post? || request.delete?)
-        unless admin_api_key?(request)
-          request.env["HTTP_API_KEY"] if request.env["HTTP_API_KEY"].present?
-        end
+      if request.api_write? && !admin_api_key?(request)
+        request.env["HTTP_API_KEY"].presence
       end
     end
 
@@ -239,6 +266,18 @@ module Rack
 
     throttle("calendar_throttle", limit: 20, period: 1.minute) do |request|
       if request.path.chomp("/") == "/calendar"
+        request.track_and_return_ip
+      end
+    end
+
+    throttle("new_article_throttle", limit: 10, period: 1.minute) do |request|
+      if request.new_article_page? && !user_signed_in?(request)
+        request.track_and_return_ip
+      end
+    end
+
+    throttle("api_users_throttle_per_minute", limit: 10, period: 1.minute) do |request|
+      if request.api_users_read? && !user_signed_in?(request)
         request.track_and_return_ip
       end
     end

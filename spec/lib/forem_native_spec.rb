@@ -10,6 +10,135 @@ RSpec.describe ForemNative do
     ->(content) { (legacy_split_word_count.call(content) / 275.0).ceil }
   end
 
+  describe ".aggregate_transcript_redactions" do
+    let(:metadata_builder) { AgentSessionParsers::RedactionMetadata }
+    let(:scrubber) { AgentSessionParsers::SensitiveDataScrubber }
+
+    def redaction_counts_from_ruby(messages)
+      Array(messages).each_with_object(Hash.new(0)) do |message, counts|
+        Array(message.dig("metadata", "redactions")).each do |redaction|
+          name = (redaction["name"] || redaction["pattern_name"]).to_s.strip
+          count = (redaction["count"] || redaction["match_count"]).to_i
+          counts[name] += count if name.present? && count.positive?
+        end
+      end
+    end
+
+    def redaction_report_from_ruby(counts)
+      counts.sort_by { |_, count| -count }.map { |name, count| { "name" => name, "count" => count } }
+    end
+
+    def message_with_redactions(*rows)
+      { "role" => "user", "metadata" => { "redactions" => rows } }
+    end
+
+    it "matches the Ruby aggregation and final report for 1,200 seeded transcripts" do
+      random = Random.new(424_242)
+      names = ["", "\0Key\r\n", "Key", "  😀 東京 ", "\u00a0\u3000", "&amp;", "a'b", "\tToken", "Other"]
+
+      1_200.times do
+        messages = Array.new(random.rand(0..18)) do
+          next [{}, { "metadata" => nil }, { "metadata" => {} }].sample(random: random) if random.rand(4).zero?
+
+          rows = Array.new(random.rand(0..6)) do
+            name = names.sample(random: random)
+            count = random.rand(-3..7)
+            if random.rand(2).zero?
+              { "name" => name, "count" => count, "match_count" => 100 }
+            else
+              { "name" => false, "pattern_name" => name, "match_count" => count }
+            end
+          end
+          message_with_redactions(*rows)
+        end
+        expected_counts = redaction_counts_from_ruby(messages)
+        expect(described_class.aggregate_transcript_redactions(messages).to_a).to eq(expected_counts.to_a)
+        expected_report = redaction_report_from_ruby(expected_counts)
+        expect(metadata_builder.from_messages(messages).to_json).to eq(expected_report.to_json)
+
+        server_redactions = Array.new(random.rand(0..3)) do
+          scrubber::Redaction.new(pattern_name: names.sample(random: random), match_count: random.rand(1..4))
+        end
+        result = scrubber::Result.new(scrubbed_data: { "messages" => messages }, redactions: server_redactions)
+        merged_counts = expected_report.each_with_object(Hash.new(0)) { |row, acc| acc[row["name"]] = row["count"] }
+        server_redactions.each { |row| merged_counts[row.pattern_name] += row.match_count }
+        expect(metadata_builder.for_scrub_result(result).to_json)
+          .to eq({ "redactions" => redaction_report_from_ruby(merged_counts) }.to_json)
+      end
+    end
+
+    it "handles zero-redaction messages, alias fallbacks, and truthy falsy-looking primary values" do
+      expect(described_class.aggregate_transcript_redactions([])).to eq({})
+      expect(described_class.aggregate_transcript_redactions([{ "role" => "user" }, {}.compare_by_identity])).to eq({})
+
+      messages = [
+        message_with_redactions(
+          { "pattern_name" => "Home", "match_count" => 2 },
+          { "name" => "", "pattern_name" => "Ignored", "count" => 3 },
+          { "name" => "ZeroCount", "count" => 0, "match_count" => 5 },
+        ),
+      ]
+      expect(described_class.aggregate_transcript_redactions(messages)).to eq({ "Home" => 2 })
+      expect(metadata_builder.from_messages(messages)).to eq([{ "name" => "Home", "count" => 2 }])
+    end
+
+    it "defers coercion, Ruby hash behavior, overflow and unusual string encodings to Ruby" do
+      row = { "name" => "Home", "count" => 1 }
+      custom_name = +"original"
+      def custom_name.strip
+        "override"
+      end
+      singleton_hash = message_with_redactions(row)
+      def singleton_hash.custom_helper
+        true
+      end
+      hash_subclass = Class.new(Hash)
+      default_proc_calls = 0
+      default_proc_hash = Hash.new do |_hash, _key|
+        default_proc_calls += 1
+        { "redactions" => [row] }
+      end
+      invalid_utf8 = (+"\xFF").force_encoding("UTF-8")
+
+      messages_sets = [
+        nil,
+        [default_proc_hash],
+        [Hash.new({ "redactions" => [row] })],
+        [{ "metadata" => { "redactions" => [row] }.compare_by_identity }],
+        [singleton_hash],
+        [hash_subclass.new.merge(message_with_redactions(row))],
+        Class.new(Array).new([message_with_redactions(row)]),
+        [message_with_redactions(row.merge("count" => "12 tokens"))],
+        [message_with_redactions(row.merge("count" => 1e-7))],
+        [message_with_redactions(row.merge("count" => 2**70))],
+        [message_with_redactions(row.merge("count" => (2**63) - 1), row)],
+        [message_with_redactions(row.merge("name" => "Home".b))],
+        [message_with_redactions(row.merge("name" => "Home".encode("US-ASCII")))],
+        [message_with_redactions(row.merge("name" => "café".encode("ISO-8859-1")))],
+        [message_with_redactions(row.merge("name" => custom_name))],
+      ]
+
+      expect(described_class.aggregate_transcript_redactions([default_proc_hash])).to be_nil
+      expect(default_proc_calls).to eq(0)
+      invalid_utf8_messages = [message_with_redactions(row.merge("name" => invalid_utf8))]
+      expect(described_class.aggregate_transcript_redactions(invalid_utf8_messages)).to be_nil
+
+      messages_sets.each do |messages|
+        expect(described_class.aggregate_transcript_redactions(messages)).to be_nil
+        expected_report = redaction_report_from_ruby(redaction_counts_from_ruby(messages))
+        expect(metadata_builder.from_messages(messages)).to eq(expected_report)
+        expect(metadata_builder.from_messages(messages).map { |entry| entry["name"].encoding })
+          .to eq(expected_report.map { |entry| entry["name"].encoding })
+      end
+    end
+
+    it "defers to Ruby for invalid nested metadata and preserves its error" do
+      messages = [{ "metadata" => [] }]
+      expect(described_class.aggregate_transcript_redactions(messages)).to be_nil
+      expect { metadata_builder.from_messages(messages) }.to raise_error(TypeError)
+    end
+  end
+
   describe ".json_encoded_size (normalized transcript validation)" do
     let(:validator) { AgentSessionParsers::NormalizedDataValidator }
 
@@ -4067,11 +4196,25 @@ RSpec.describe ForemNative do
         mentions_service = Mentions::CreateAll.new(notifiable_stub)
         base_url = "#{ApplicationConfig['APP_PROTOCOL']}#{Settings::General.app_domain}"
 
+        user_relation = Class.new do
+          def initialize(values)
+            @values = values
+          end
+
+          def pluck(_column)
+            @values
+          end
+        end
+
         rng = Random.new(424_242)
         1_000.times do |iteration|
           fragment = Array.new(rng.rand(1..6)) { blocks_pool.sample(random: rng) }.join("\n")
           existing_users = user_pool.sample(rng.rand(0..5), random: rng)
           allow(User).to receive(:find_by) { |args| existing_users.include?(args[:username]) ? :user : nil }
+          allow(User).to receive(:where) do |args|
+            matched = Array(args[:username]).select { |username| existing_users.include?(username) }
+            user_relation.new(matched)
+          end
 
           # Individual primitives parity
           expect(described_class.add_control_class_to_codeblock(fragment))
@@ -4133,6 +4276,150 @@ RSpec.describe ForemNative do
           end
 
           expect(native_chain).to eq(legacy_parser.html), "pipeline chain iter #{iteration}"
+        end
+      end
+    end
+
+    describe ".postprocess_rendered_html (MarkdownProcessor::Parser & Html::Parser pipeline)" do
+      it "matches legacy outbound link, list, video, fullscreen, and fused pipelines across " \
+         "1,000 randomized documents", :aggregate_failures do
+        app_domain = Settings::General.app_domain
+        base_url = "#{ApplicationConfig['APP_PROTOCOL']}#{app_domain}"
+        md_parser = MarkdownProcessor::Parser.new("")
+        html_parser = Html::Parser.new("")
+        action_html = html_parser.fullscreen_action_html
+
+        # Out-of-domain samples return nil from ForemNative and fall back cleanly to legacy_*
+        out_of_domain_samples = [
+          '<p><a href="javascript:alert(1)">bad</a></p>',
+          '<p><a href="data:text/html,hi">bad</a></p>',
+          "<VIDEO src='a.mp4'></VIDEO>",
+          "<div class='highlight__panel'>x</div>",
+          "<ul><li><br></li></ul>",
+          "<p>a</p><p>b</p>\n",
+        ]
+        out_of_domain_samples.each do |sample|
+          expect(described_class.postprocess_rendered_html(sample, app_domain: app_domain,
+                                                                   fullscreen_action_html: action_html,
+                                                                   existing_usernames: [],
+                                                                   base_url: base_url)).to be_nil
+        end
+        expect(
+          described_class.add_target_blank_to_outbound_links(
+            '<p><a href="javascript:alert(1)">bad</a></p>',
+            app_domain,
+          ),
+        ).to be_nil
+        expect(described_class.enforce_gif_like_videos("<VIDEO src='a.mp4'></VIDEO>")).to be_nil
+        expect(described_class.add_fullscreen_button_to_panel("<div class='highlight__panel'>x</div>",
+                                                              action_html)).to be_nil
+
+        many_tokens = Array.new(64) { |idx| "tok#{idx}" }
+        rel_html = "<p><a href=\"https://example.com\" rel=\"#{many_tokens.join(' ')} tok0 noopener\">ext</a></p>"
+        expect(described_class.add_target_blank_to_outbound_links(rel_html, app_domain))
+          .to eq(md_parser.__send__(:legacy_add_target_blank_to_outbound_links, rel_html, app_domain))
+
+        # Legacy fallback equivalence on out-of-domain inputs
+        js_link = '<p><a href="javascript:alert(1)">bad</a></p>'
+        expect(md_parser.__send__(:add_target_blank_to_outbound_links, js_link))
+          .to eq(md_parser.__send__(:legacy_add_target_blank_to_outbound_links, js_link, app_domain))
+
+        upper_video = "<VIDEO src='a.mp4'></VIDEO>"
+        expect(Html::Parser.new(upper_video).enforce_gif_like_videos.html)
+          .to eq(Html::Parser.new(upper_video).__send__(:legacy_enforce_gif_like_videos))
+
+        single_quote_panel = "<div class='highlight__panel'>x</div>"
+        expect(Html::Parser.new(single_quote_panel).add_fullscreen_button_to_panel.html)
+          .to eq(Html::Parser.new(single_quote_panel).__send__(:legacy_add_fullscreen_button_to_panel, action_html))
+
+        blocks_pool = [
+          "<p>Plain text :joy: with @alice and @bob_2, email test@example.com</p>",
+          '<p><a href="https://github.com/forem">GitHub</a> and ' \
+          '<a href="https://example.com" rel="nofollow">Ext</a></p>',
+          "<p><a href=\"https://#{app_domain}/post?a=1&amp;b=2\">Internal</a> and <a href=\"/t/ruby\">Rel</a></p>",
+          "<ul>\n<li>Item 1<br>continued</li>\n<li>Item 2</li>\n</ul>",
+          '<p><video src="https://example.com/clip.mp4"></video></p>',
+          '<p><video src="https://example.com/clip2.mp4" controls="controls" preload="auto"></video></p>',
+          '<p><img src="https://example.com/pic.png" alt="pic"></p>',
+          %(<div class="highlight"><pre class="highlight ruby"><code>puts ":smile:" # @alice\n</code></pre></div>),
+          '<div class="highlight"><pre class="highlight liquid"><code>' \
+          '<span class="p">{</span><span class="o">----%</span>' \
+          '<span class="w"> </span><span class="nt">raw</span><span class="w"> </span>' \
+          '<span class="o">%----</span><span class="p">}</span>' \
+          '</code></pre></div>',
+          "<table>\n<thead>\n<tr>\n<th>Col</th>\n</tr>\n</thead>\n" \
+          "<tbody>\n<tr>\n<td>@charlie</td>\n</tr>\n</tbody>\n</table>",
+          "<p></p>",
+          "<p>Trailing UTF-8 🚀 日本語</p>",
+        ]
+
+        user_pool = %w[alice bob_2 charlie dave]
+        user_relation = Class.new do
+          def initialize(values)
+            @values = values
+          end
+
+          def pluck(_column)
+            @values
+          end
+        end
+
+        rng = Random.new(424_242)
+        1_000.times do |iteration|
+          fragment = "#{Array.new(rng.rand(1..5)) { blocks_pool.sample(random: rng) }.join("\n")}\n"
+          existing_users = user_pool.sample(rng.rand(0..4), random: rng)
+          allow(User).to receive(:find_by) { |args| existing_users.include?(args[:username]) ? :user : nil }
+          allow(User).to receive(:where) do |args|
+            matched = Array(args[:username]).select { |username| existing_users.include?(username) }
+            user_relation.new(matched)
+          end
+
+          # Tier 1 primitives parity
+          expect(described_class.add_target_blank_to_outbound_links(fragment, app_domain))
+            .to eq(md_parser.__send__(:legacy_add_target_blank_to_outbound_links, fragment, app_domain)),
+                "add_target_blank_to_outbound_links iter #{iteration}"
+
+          expect(described_class.enforce_gif_like_videos(fragment))
+            .to eq(Html::Parser.new(fragment.dup).__send__(:legacy_enforce_gif_like_videos)),
+                "enforce_gif_like_videos iter #{iteration}"
+
+          with_panel = described_class.add_control_panel_to_codeblock(fragment)
+          expect(described_class.add_fullscreen_button_to_panel(with_panel, action_html))
+            .to eq(Html::Parser.new(with_panel.dup).__send__(:legacy_add_fullscreen_button_to_panel, action_html)),
+                "add_fullscreen_button_to_panel iter #{iteration}"
+
+          # Tier 2 fused postprocess_rendered_html parity vs full legacy chain
+          legacy_out = md_parser.__send__(:legacy_add_target_blank_to_outbound_links, fragment, app_domain)
+          lp = Html::Parser.new(legacy_out)
+          lp.remove_nested_linebreak_in_list
+          lp.__send__(:html=, Nokogiri::HTML.fragment(lp.html).to_html)
+          lp.__send__(:html=, lp.__send__(:legacy_wrap_all_images_in_links))
+          lp.__send__(:html=, lp.__send__(:legacy_enforce_gif_like_videos))
+          lp.__send__(:html=, lp.__send__(:legacy_add_control_class_to_codeblock))
+          lp.__send__(:html=, lp.__send__(:legacy_add_control_panel_to_codeblock))
+          lp.__send__(:html=, lp.__send__(:legacy_add_fullscreen_button_to_panel, action_html))
+          lp.__send__(:html=, lp.__send__(:legacy_wrap_all_tables))
+          lp.__send__(:html=, lp.__send__(:legacy_remove_empty_paragraphs))
+          lp.__send__(:html=, lp.__send__(:legacy_escape_colon_emojis_in_codeblock))
+          lp.__send__(:html=, lp.__send__(:legacy_unescape_raw_tag_in_codeblocks)) if lp.html.present?
+          lp.__send__(:html=, lp.__send__(:legacy_wrap_mentions_with_links)) if lp.html.present?
+
+          native_out = described_class.postprocess_rendered_html(
+            fragment,
+            app_domain: app_domain,
+            fullscreen_action_html: action_html,
+            existing_usernames: existing_users,
+            base_url: base_url,
+            run_target_blank: true,
+            normalize_document: true,
+          )
+
+          # When all paragraphs were empty, Rust intentionally returns nil to defer to Nokogiri.
+          if native_out.nil?
+            expect(Html::Parser.new(fragment).remove_empty_paragraphs.html.strip).to eq("")
+          else
+            expect(native_out).to eq(lp.html), "postprocess_rendered_html iter #{iteration}"
+          end
         end
       end
     end
@@ -7095,6 +7382,508 @@ RSpec.describe ForemNative do
           expect(ForemNative::Builder.binary_exports_symbol?(tmp.path, :ELF_WITHOUT_REQUIRED_SYMBOL))
             .to be(true)
         end
+      end
+    end
+  end
+
+  describe "Ahoy email link tracking kernels" do
+    require "addressable/uri"
+    require "base64"
+    require "cgi"
+    require "nokogiri"
+    require "openssl"
+
+    let(:secret_token) { "forem_test_ahoy_secret_token_32bytes" }
+    let(:app_domain) { "dev.to" }
+    let(:external_base) { "https://dev.to/ahoy/click" }
+
+    let(:legacy_signature) do
+      lambda do |secret, token, campaign, url|
+        data = [token, campaign, url].map { |v| Base64.strict_encode64(v.to_s) }.join("|")
+        Base64.urlsafe_encode64(OpenSSL::HMAC.digest("SHA256", secret, data), padding: false)
+      end
+    end
+
+    let(:legacy_decorate_url) do
+      lambda do |href, domain, token, campaign, secret, ext_base|
+        uri = begin
+          Addressable::URI.heuristic_parse(href.to_s)
+        rescue StandardError
+          nil
+        end
+        next nil unless uri&.absolute? && %w[http https].include?(uri.scheme)
+        next nil if href.to_s.match?(/unsubscribe/i)
+        next nil if href.to_s.include?("ahoy_click=true")
+        next nil if uri.host == domain && uri.path.to_s.start_with?("/ahoy/")
+
+        sig = legacy_signature.call(secret, token, campaign, href)
+        if uri.host == domain
+          tracking_params = {
+            "ahoy_click" => true,
+            "t" => token,
+            "s" => sig,
+            "u" => CGI.escape(href),
+            "c" => campaign
+          }.reject { |_k, v| v.nil? || v.to_s.empty? }
+          uri.query_values = (uri.query_values(Array) || []) + tracking_params.to_a
+          port_part = uri.port ? ":#{uri.port}" : ""
+          url = "#{uri.scheme}://#{uri.host}#{port_part}#{uri.path}"
+          url += "?#{uri.query}" if uri.query && uri.query != ""
+          url
+        else
+          params = []
+          params << "c=#{CGI.escape(campaign)}" unless campaign.nil?
+          params << "s=#{CGI.escape(sig)}"
+          params << "t=#{CGI.escape(token)}"
+          params << "u=#{CGI.escape(href)}"
+          "#{ext_base}?#{params.join('&')}"
+        end
+      end
+    end
+
+    let(:legacy_decorate_html) do
+      lambda do |html, domain, token, campaign, secret, ext_base|
+        doc = Nokogiri::HTML::DocumentFragment.parse(html)
+        doc.css("a[href]").each do |link|
+          if link["data-skip-click"]
+            link.remove_attribute("data-skip-click")
+            next
+          end
+          decorated = legacy_decorate_url.call(link["href"], domain, token, campaign, secret, ext_base)
+          link["href"] = decorated if decorated
+        end
+        doc.to_s.gsub("&amp;", "&")
+      end
+    end
+
+    it "matches AhoyEmail::Utils.signature across edge cases and 1,000 randomized inputs" do
+      rng = Random.new(424_242)
+      edge_cases = [
+        ["short", "tok", "", "https://dev.to/ben/post"],
+        ["a" * 100, "token_with_unicode_🚀", "digest-2026", "https://dev.to/search?q=100%25%20ruby&x=café"],
+        [secret_token, "", "", ""],
+        [secret_token, "abc123", "spring 2026", "https://example.com/a?b=1&c=2#frag"],
+      ]
+      edge_cases.each do |secret, tok, camp, url|
+        expect(described_class.ahoy_signature(secret, tok, camp, url))
+          .to eq(legacy_signature.call(secret, tok, camp, url))
+      end
+
+      alphabet = ("a".."z").to_a + ("A".."Z").to_a + ("0".."9").to_a + %w[- _ . ~ / ? & = % + : # café 🚀]
+      1_000.times do |i|
+        secret = Array.new(rng.rand(1..96)) { alphabet.sample(random: rng) }.join
+        tok = Array.new(rng.rand(0..40)) { alphabet.sample(random: rng) }.join
+        camp = rng.rand(3).zero? ? "" : Array.new(rng.rand(1..24)) { alphabet.sample(random: rng) }.join
+        url = "https://dev.to/#{Array.new(rng.rand(0..60)) { alphabet.sample(random: rng) }.join}"
+        expect(described_class.ahoy_signature(secret, tok, camp, url))
+          .to eq(legacy_signature.call(secret, tok, camp, url)), "iteration #{i}"
+      end
+    end
+
+    it "matches legacy URL decoration across internal, external, skip, plain-text, and out-of-domain inputs" do
+      # Out-of-domain inputs return nil so Ruby falls back cleanly
+      [
+        "example.com",
+        "dev.to/ben/post",
+        "  https://dev.to/ben/post  ",
+        "https://user:pass@example.com/post",
+        "https://dev.to/post?bad=%ZZ",
+        "https://dev.to/post?a=1&&b=2",
+      ].each do |out_of_domain|
+        expect(
+          described_class.ahoy_decorate_url(out_of_domain, app_domain, "tok", nil, secret_token, external_base),
+        ).to be_nil, "expected nil for #{out_of_domain.inspect}"
+      end
+
+      # External URL without external_base_url returns nil (defer to Ruby url_for)
+      expect(
+        described_class.ahoy_decorate_url("https://example.com/post", app_domain, "tok", nil, secret_token, nil),
+      ).to be_nil
+
+      # Guaranteed unchanged/skipped inputs return false (no Ruby fallback needed)
+      [
+        "",
+        "Ben Halpern",
+        "A post you might like",
+        "A post you might like.",
+        "1.5 minutes read",
+        "mailto:yo@example.com",
+        "javascript:alert(1)",
+        "/relative/path.html",
+        "#section.1",
+        "https://dev.to/email_subscriptions/unsubscribe?ut=xyz",
+        "https://dev.to/post?ahoy_click=true&t=old&s=sig&u=x",
+        "https://dev.to/ahoy/click?t=old&s=sig&u=https%3A%2F%2Fexample.com",
+      ].each do |unchanged|
+        expect(
+          described_class.ahoy_decorate_url(unchanged, app_domain, "tok", nil, secret_token, external_base),
+        ).to be(false), "expected false for #{unchanged.inspect}"
+      end
+
+      # 1,000 randomized differential URLs
+      rng = Random.new(424_242)
+      hosts = ["dev.to", "dev.to:3000", "DEV.TO", "example.com", "github.com", "sub.example.org:8443"]
+      paths = ["", "/", "/ben/some-post", "/search", "/ahoy/click", "/email_subscriptions/unsubscribe", "/ben/café"]
+      queries = [
+        nil,
+        "",
+        "context=digest",
+        "q=100%25%20ruby&sort=top",
+        "a+b=hello+world&b=foo%20bar&c+d&bare&empty=",
+        "bb=42&tag=ruby&tag=rust",
+        "ahoy_click=true&t=old",
+      ]
+      campaigns = [nil, "", "digest", "weekly digest 2026"]
+
+      # Explicit edge cases: literal `+` in query keys and empty token preserving existing `t`
+      [
+        ["https://dev.to/search?a+b=one+two&c+d", "tok123", nil],
+        ["https://dev.to/post?t=original", "", nil],
+      ].each do |href, tok, camp|
+        native = described_class.ahoy_decorate_url(href, app_domain, tok, camp, secret_token, external_base)
+        expected = legacy_decorate_url.call(href, app_domain, tok, camp, secret_token, external_base)
+        expect(native).to eq(expected), "href=#{href.inspect} tok=#{tok.inspect}"
+      end
+
+      1_000.times do |i|
+        scheme = %w[http https HTTP HTTPS].sample(random: rng)
+        host = hosts.sample(random: rng)
+        path = paths.sample(random: rng)
+        query = queries.sample(random: rng)
+        frag = rng.rand(4).zero? ? "#section-#{rng.rand(1..9)}" : ""
+        href = "#{scheme}://#{host}#{path}#{query ? "?#{query}" : ''}#{frag}"
+        tok = "tok_#{rng.rand(10_000)}_#{['a', 'b c', 'x~y'].sample(random: rng)}"
+        camp = campaigns.sample(random: rng)
+
+        native = described_class.ahoy_decorate_url(href, app_domain, tok, camp, secret_token, external_base)
+        expected = legacy_decorate_url.call(href, app_domain, tok, camp, secret_token, external_base)
+        actual = native == false ? nil : native
+        expect(actual).to eq(expected), "iteration #{i}: href=#{href.inspect} camp=#{camp.inspect}"
+      end
+    end
+
+    it "rewrites HTML fragments identically to the Ruby reference" do
+      html_cases = [
+        %(<div><a href="https://dev.to/ben/some-post?context=digest">Read</a></div>),
+        %(<a href="https://dev.to/sponsor?bb=42">Ad</a>),
+        %(<a href="https://dev.to/ben/post" data-skip-click="true">Skip</a>),
+        %(<a href="https://dev.to/ben/post" data-skip-click>Skip bool</a>),
+        %(<p>Hello &amp; welcome <a href="https://dev.to/ben/post?a=1&amp;b=2">here</a> and <a href="https://example.com/x">there</a></p>),
+        %(<article><p>No anchors here</p></article>),
+        %(<img alt="Example: <a href='https://dev.to/post'>">),
+        %(<a href='https://dev.to/ben/single-quoted'>Read</a>),
+      ]
+
+      html_cases.each do |html|
+        actual = described_class.ahoy_decorate_html(html, app_domain, "tok123", "digest", secret_token, external_base)
+        expected = legacy_decorate_html.call(html, app_domain, "tok123", "digest", secret_token, external_base)
+        actual_doc = Nokogiri::HTML::DocumentFragment.parse(actual)
+        expected_doc = Nokogiri::HTML::DocumentFragment.parse(expected)
+        actual_anchors = actual_doc.css("a[href]").map { |a| a.attributes.transform_values(&:value) }
+        expected_anchors = expected_doc.css("a[href]").map { |a| a.attributes.transform_values(&:value) }
+        expect(actual_anchors).to eq(expected_anchors), "html=#{html.inspect}"
+        expect(actual).not_to include("data-skip-click")
+      end
+
+      [
+        %(<!-- <a href="https://dev.to/a">A</a> -->),
+        %(<textarea><a href="https://dev.to/a">A</a></textarea>),
+        %(<a href='https://dev.to/post"title="injected'>Read</a>),
+      ].each do |deferred_html|
+        expect(
+          described_class.ahoy_decorate_html(
+            deferred_html,
+            app_domain, "tok", nil, secret_token, external_base
+          ),
+        ).to be_nil, "expected nil for #{deferred_html.inspect}"
+      end
+    end
+
+    it "rewrites nested Customer.io payloads in a single FFI crossing" do
+      payload = {
+        "subject" => "Your weekly DEV digest.",
+        "name" => "Ben",
+        "count" => 42,
+        "unsubscribe_url" => "https://dev.to/email_subscriptions/unsubscribe?ut=xyz",
+        "articles" => [
+          {
+            "title" => "1.5 minutes read: Rust in Forem",
+            "url" => "https://dev.to/ben/rust-in-forem?context=digest",
+            "smart_summary" => %(<p>Check out <a href="https://dev.to/ben/rust-in-forem">this post</a> and <a href="https://example.com/docs">docs</a>.</p>)
+          },
+        ],
+        "billboards_html" => {
+          "first" => %(<a href="https://dev.to/sponsor?bb=42">Sponsor</a>)
+        }
+      }
+      result = described_class.ahoy_decorate_payload(payload, app_domain, "tok123", nil, secret_token, external_base)
+      expected_sponsor = legacy_decorate_url.call(
+        "https://dev.to/sponsor?bb=42", app_domain, "tok123", nil, secret_token, external_base
+      )
+      expect(result["subject"]).to equal(payload["subject"])
+      expect(result["name"]).to equal(payload["name"])
+      expect(result["count"]).to eq(42)
+      expect(result["unsubscribe_url"]).to equal(payload["unsubscribe_url"])
+      expect(result["articles"][0]["url"]).to eq(
+        legacy_decorate_url.call(payload["articles"][0]["url"], app_domain, "tok123", nil, secret_token, external_base),
+      )
+      expect(
+        Nokogiri::HTML::DocumentFragment.parse(result["billboards_html"]["first"]).at_css("a")["href"],
+      ).to eq(expected_sponsor)
+    end
+
+    it "defers identity hashes and stays safe across GC compaction during payload walks" do
+      identity_hash = {}.compare_by_identity
+      identity_hash[+"url"] = "https://dev.to/ben/first"
+      identity_hash[+"url"] = "https://dev.to/ben/second"
+      expect(
+        described_class.ahoy_decorate_payload(identity_hash, app_domain, "tok123", nil, secret_token, external_base),
+      ).to be_nil
+
+      large_payload = {
+        "items" => Array.new(64) do |idx|
+          { "k#{idx}" => "https://dev.to/ben/post-#{idx}", "ext" => "https://example.com/p/#{idx}" }
+        end
+      }
+      GC.compact if GC.respond_to?(:compact)
+      compacted_result = described_class.ahoy_decorate_payload(
+        large_payload, app_domain, "tok123", nil, secret_token, external_base
+      )
+      expect(compacted_result["items"].size).to eq(64)
+      expect(compacted_result["items"].last["k63"]).to include("ahoy_click=true")
+    end
+  end
+
+  describe "FeedEvents ingestion, deduplication & FeedConfig counter scoring kernels" do
+    let(:categories) { %w[impression click reaction comment extended_pageview] }
+    let(:category_map) { categories.each_with_index.to_h }
+    let(:contexts) { %w[home search tag email sidebar] }
+
+    let(:legacy_timebox_sql) do
+      lambda do |events|
+        return if events.empty?
+
+        seen = {}
+        tuples = []
+        events.each do |ev|
+          article_id = ev[:article_id] || ev["article_id"]
+          user_id = ev[:user_id] || ev["user_id"] || 0
+          cat = ev[:category] || ev["category"]
+          cat_code = cat.is_a?(Integer) ? cat : category_map[cat.to_s]
+          key = [article_id, user_id, cat_code]
+          next if seen[key]
+
+          seen[key] = true
+          tuples << "(#{article_id},#{user_id},#{cat_code})"
+        end
+        "(article_id, COALESCE(user_id, 0), category) IN (#{tuples.join(',')})"
+      end
+    end
+
+    let(:legacy_deduplicate) do
+      lambda do |events, existing_tuples|
+        recent = Hash.new { |u, uid| u[uid] = Hash.new { |c, cat| c[cat] = {} } }
+        existing_tuples.each do |user_id, category, article_id, context_type, feed_config_id|
+          recent[user_id][category.to_s][[article_id, context_type.to_s, feed_config_id]] = true
+        end
+
+        events.filter_map do |ev|
+          uid = ev[:user_id]
+          cat = ev[:category].to_s
+          key = [ev[:article_id], ev[:context_type].to_s, ev[:feed_config_id]]
+          next if recent[uid][cat][key]
+
+          recent[uid][cat][key] = true
+          ev
+        end
+      end
+    end
+
+    let(:legacy_freshness) do
+      lambda do |published_at, event_time, lookback_setting|
+        return 1.0 if published_at.nil? || event_time.nil?
+
+        age_in_hours = (event_time.to_f - published_at.to_f) / 3600.0
+        return 1.5 if age_in_hours <= 12.0
+
+        lookback_days = lookback_setting.positive? ? lookback_setting : 10
+        lookback_hours = lookback_days * 24.0
+        return 1.0 if age_in_hours >= lookback_hours || lookback_hours <= 12.0
+
+        decay_window = lookback_hours - 12.0
+        progress = (age_in_hours - 12.0) / decay_window
+        raw_decay = 1.0 / (1.0 + (4.0 * progress))
+        min_decay = 1.0 / (1.0 + 4.0)
+        normalized_decay = (raw_decay - min_decay) / (1.0 - min_decay)
+        1.0 + (0.5 * normalized_decay)
+      end
+    end
+
+    let(:legacy_aggregate_counters) do
+      lambda do |rows, lookback_setting|
+        impressions_total = 0
+        impressions_users = Set.new
+        clicks_score = 0.0
+        best_freshness = { "reaction" => {}, "comment" => {}, "extended_pageview" => {} }
+
+        rows.each do |category, user_id, position, event_time, published_at|
+          cat = category.is_a?(Integer) ? categories[category] : category.to_s
+          case cat
+          when "impression"
+            impressions_total += 1
+            impressions_users.add(user_id)
+          when "click"
+            clicks_score += ((2.0 / 3)**(position.to_i - 1)) *
+              legacy_freshness.call(published_at, event_time, lookback_setting)
+          when "reaction", "comment", "extended_pageview"
+            freshness = legacy_freshness.call(published_at, event_time, lookback_setting)
+            user_scores = best_freshness[cat]
+            user_scores[user_id] = freshness if user_scores[user_id].nil? || freshness > user_scores[user_id]
+          end
+        end
+
+        next [0, 0.0] if impressions_total.zero?
+
+        reactions_score = best_freshness["reaction"].values.sum * 6 * 2
+        comments_score = best_freshness["comment"].values.sum * 12 * 2
+        pageviews_score = best_freshness["extended_pageview"].values.sum
+        score = (clicks_score + pageviews_score + reactions_score + comments_score).to_f / impressions_users.size
+        [impressions_total, score, impressions_users.size]
+      end
+    end
+
+    it "builds deduplicated feed_events_timebox_lookup_sql across edge cases and 1,000 randomized batches" do
+      expect(described_class.feed_events_timebox_lookup_sql([])).to be_nil
+      expect(described_class.feed_events_timebox_lookup_sql("not-an-array")).to be_nil
+      # Out-of-domain and malformed inputs return nil for parameterized Ruby fallback
+      expect(described_class.feed_events_timebox_lookup_sql([Object.new])).to be_nil
+      expect(described_class.feed_events_timebox_lookup_sql([{ article_id: "123", user_id: 1, category: "click" }]))
+        .to be_nil
+      expect(
+        described_class.feed_events_timebox_lookup_sql([{ article_id: 1, user_id: "1) OR 1=1--", category: "click" }]),
+      ).to be_nil
+      expect(described_class.feed_events_timebox_lookup_sql([{ article_id: 1, user_id: 1, category: "bogus" }]))
+        .to be_nil
+
+      # Both symbol-keyed and string-keyed hashes, plus nil user_id coalesced to 0
+      mixed = [
+        { article_id: 10, user_id: nil, category: "impression" },
+        { "article_id" => 10, "user_id" => nil, "category" => :impression },
+        { article_id: 11, user_id: 42, category: 1 },
+      ]
+      expect(described_class.feed_events_timebox_lookup_sql(mixed)).to eq(
+        "(article_id, COALESCE(user_id, 0), category) IN ((10,0,0),(11,42,1))",
+      )
+
+      rng = Random.new(424_242)
+      1_000.times do |i|
+        batch = Array.new(rng.rand(1..20)) do
+          {
+            article_id: rng.rand(1..15),
+            user_id: rng.rand(3).zero? ? nil : rng.rand(1..5),
+            category: categories.sample(random: rng)
+          }
+        end
+        expect(described_class.feed_events_timebox_lookup_sql(batch))
+          .to eq(legacy_timebox_sql.call(batch)), "iteration #{i}"
+      end
+    end
+
+    it "deduplicates feed events identically to Ruby nested hashes across edge cases and 1,000 randomized batches" do
+      expect(described_class.deduplicate_feed_events([], [])).to eq([])
+      expect(described_class.deduplicate_feed_events([Object.new], [])).to be_nil
+      expect(described_class.deduplicate_feed_events([], [[1, "impression"]])).to be_nil
+      expect(described_class.deduplicate_feed_events([{ article_id: 1, category: "bad", context_type: "home" }], []))
+        .to be_nil
+
+      rng = Random.new(424_242)
+      1_000.times do |i|
+        existing = Array.new(rng.rand(0..15)) do
+          [
+            rng.rand(3).zero? ? nil : rng.rand(1..4),
+            categories.sample(random: rng),
+            rng.rand(1..8),
+            contexts.sample(random: rng),
+            rng.rand(3).zero? ? nil : rng.rand(1..3),
+          ]
+        end
+        events = Array.new(rng.rand(1..25)) do |idx|
+          {
+            article_id: rng.rand(1..8),
+            user_id: rng.rand(3).zero? ? nil : rng.rand(1..4),
+            article_position: idx + 1,
+            category: categories.sample(random: rng),
+            context_type: contexts.sample(random: rng),
+            feed_config_id: rng.rand(3).zero? ? nil : rng.rand(1..3),
+            event_id: nil
+          }
+        end
+
+        actual = described_class.deduplicate_feed_events(events, existing)
+        expected = legacy_deduplicate.call(events, existing)
+        expect(actual).to eq(expected), "iteration #{i}"
+        # Preserves original Hash object identity (zero Hash cloning)
+        actual.each_with_index do |h, idx|
+          expect(h).to equal(expected[idx])
+        end
+      end
+    end
+
+    it "computes article_freshness_multiplier identically to Ruby across boundaries and 1,000 randomized inputs" do
+      base = 1_700_000_000.0
+      expect(described_class.article_freshness_multiplier(nil, base, 10)).to eq(1.0)
+      expect(described_class.article_freshness_multiplier(base, nil, 10)).to eq(1.0)
+      expect(described_class.article_freshness_multiplier("bad", base, 10)).to be_nil
+      expect(described_class.article_freshness_multiplier(base - 3600.0, base, 10)).to eq(1.5)
+      expect(described_class.article_freshness_multiplier(base - (12 * 3600.0), base, 10)).to eq(1.5)
+      expect(described_class.article_freshness_multiplier(base - (10 * 86_400.0), base, 10)).to eq(1.0)
+
+      rng = Random.new(424_242)
+      1_000.times do |i|
+        event_ts = base + rng.rand(0.0..100_000.0)
+        age_secs = rng.rand(-3_600.0..(15 * 86_400.0))
+        pub_ts = rng.rand(10).zero? ? nil : event_ts - age_secs
+        lookback = [-5, 0, 1, 5, 10, 14, 30].sample(random: rng)
+
+        expect(described_class.article_freshness_multiplier(pub_ts, event_ts, lookback))
+          .to eq(legacy_freshness.call(pub_ts, event_ts, lookback)), "iteration #{i}"
+      end
+    end
+
+    it "aggregates feed config counters identically to Ruby across Time/Float rows and 1,000 randomized datasets" do
+      expect(described_class.aggregate_feed_config_counters([], 10)).to eq([0, 0.0])
+      expect(described_class.aggregate_feed_config_counters([[1, 2]], 10)).to be_nil
+      expect(described_class.aggregate_feed_config_counters([["click", 1, 1, "", 1_700_000_000.0]], 10)).to be_nil
+
+      # Verify compatibility with Ruby Time objects in addition to float epochs
+      now = Time.utc(2026, 11, 20, 12, 0, 0)
+      time_rows = [
+        ["impression", 1, 1, now, now - 3600],
+        ["click", 1, 2, now, now - (3 * 86_400)],
+        ["reaction", 1, 1, now, now - (5 * 86_400)],
+        ["comment", nil, 1, now, nil],
+      ]
+      expect(described_class.aggregate_feed_config_counters(time_rows, 10))
+        .to eq(legacy_aggregate_counters.call(time_rows, 10))
+
+      rng = Random.new(424_242)
+      base = 1_700_000_000.0
+      1_000.times do |i|
+        lookback = [0, 5, 10, 20].sample(random: rng)
+        rows = Array.new(rng.rand(0..40)) do
+          event_ts = base + rng.rand(0.0..50_000.0)
+          pub_ts = rng.rand(6).zero? ? nil : event_ts - rng.rand(0.0..(14 * 86_400.0))
+          [
+            categories.sample(random: rng),
+            rng.rand(5).zero? ? nil : rng.rand(1..12),
+            rng.rand(10).zero? ? nil : rng.rand(1..15),
+            event_ts,
+            pub_ts,
+          ]
+        end
+
+        expect(described_class.aggregate_feed_config_counters(rows, lookback))
+          .to eq(legacy_aggregate_counters.call(rows, lookback)), "iteration #{i}"
       end
     end
   end

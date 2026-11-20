@@ -7,6 +7,7 @@ class Billboard < ApplicationRecord
   belongs_to :audience_segment, optional: true
   belongs_to :page, optional: true
   belongs_to :event, optional: true
+  belongs_to :billboard_campaign, optional: true
 
   ALLOWED_PLACEMENT_AREAS = %w[sidebar_left
                                sidebar_left_2
@@ -58,17 +59,17 @@ class Billboard < ApplicationRecord
   EMBEDDED_PLACEMENTS = %w[external_feed].freeze
 
   HOME_FEED_PLACEMENTS = %w[feed_first feed_second feed_third].freeze
+  POST_PLACEMENTS = %w[post_fixed_bottom
+                       post_body_bottom
+                       post_body_bottom_secondary
+                       post_sidebar
+                       post_sidebar_secondary
+                       post_comments
+                       post_comments_secondary
+                       post_comments_mid].freeze
   # Placement areas that pages load in the context of the article or page they're on
   # (see BillboardHelper#billboard_async_path)
-  CONTEXTUAL_PLACEMENTS = %w[page_fixed_bottom
-                             post_fixed_bottom
-                             post_body_bottom
-                             post_body_bottom_secondary
-                             post_sidebar
-                             post_sidebar_secondary
-                             post_comments
-                             post_comments_secondary
-                             post_comments_mid].freeze
+  CONTEXTUAL_PLACEMENTS = (["page_fixed_bottom"] + POST_PLACEMENTS).freeze
   HOME_PAGE_PLACEMENTS = %w[feed_first
                             feed_second
                             feed_third
@@ -104,6 +105,9 @@ class Billboard < ApplicationRecord
   validates :minimized_body_markdown, presence: true, if: :persistent?
   validates :organization, presence: true, if: :community?
   validates :weight, numericality: { greater_than_or_equal_to: 0, less_than_or_equal_to: 10_000 }
+  validates :max_impressions_count, :max_clicks_count,
+            numericality: { only_integer: true, greater_than_or_equal_to: 0,
+                            less_than_or_equal_to: BillboardCampaign::MAX_CAP }
   validates :audience_segment_type,
             inclusion: { in: AudienceSegment.type_ofs },
             allow_blank: true
@@ -113,7 +117,8 @@ class Billboard < ApplicationRecord
            :valid_manual_audience_segment,
            :validate_tag,
            :validate_geolocations,
-           :validate_expiration_approval
+           :validate_expiration_approval,
+           :validate_delivery_cap_approval
 
   before_validation :process_markdown
   before_save :update_exclude_article_ids
@@ -364,6 +369,11 @@ class Billboard < ApplicationRecord
     selected_number.to_i
   end
 
+  def self.human_readable_placement_area(area)
+    index = ALLOWED_PLACEMENT_AREAS.find_index(area.to_s)
+    index ? ALLOWED_PLACEMENT_AREAS_HUMAN_READABLE[index] : area.to_s
+  end
+
   def processed_html_final
     # This is a final non-database-driven step to adjust processed html
     # It is sort of a hack to avoid having to reprocess all articles
@@ -381,7 +391,7 @@ class Billboard < ApplicationRecord
   end
 
   def human_readable_placement_area
-    ALLOWED_PLACEMENT_AREAS_HUMAN_READABLE[ALLOWED_PLACEMENT_AREAS.find_index(placement_area)]
+    self.class.human_readable_placement_area(placement_area)
   end
 
   def validate_tag
@@ -409,6 +419,26 @@ class Billboard < ApplicationRecord
     return unless expires_at.present? && expires_at < Time.current && approved?
 
     errors.add(:approved, "cannot be set to true if billboard has expired")
+  end
+
+  def validate_delivery_cap_approval
+    return unless approved? && will_save_change_to_approved?
+    return unless over_cap? || billboard_campaign&.expired? || billboard_campaign&.over_cap?(self)
+
+    errors.add(:approved, "cannot be set to true once the billboard or its campaign has ended or reached a cap")
+  end
+
+  def delivery_limit_reached?
+    (expires_at.present? && expires_at < Time.current) || over_cap? ||
+      billboard_campaign&.expired? || billboard_campaign&.over_cap?(self)
+  end
+
+  def over_cap?
+    cap_reached?(max_impressions_count, impressions_count) || cap_reached?(max_clicks_count, clicks_count)
+  end
+
+  def cap_reached?(cap, count)
+    cap.to_i.positive? && count.to_i >= cap.to_i
   end
 
   def audience_segment_type
@@ -555,8 +585,16 @@ class Billboard < ApplicationRecord
     0 # Just to allow this to repond to .score for abuse reports
   end
 
-  def check_and_handle_expiration
-    return unless expires_at.present? && expires_at < Time.current && approved?
+  # Locks the campaigns this save or destroy moves the billboard out of or into, so the campaign
+  # checks in BillboardPolicy can't race a sibling's approval. Call inside the billboard's row lock.
+  def lock_affected_campaigns!
+    ids = [billboard_campaign_id, attribute_in_database(:billboard_campaign_id)].compact.uniq
+    BillboardCampaign.where(id: ids).order(:id).lock.ids if ids.any?
+  end
+
+  # Takes the billboard down once it, or its campaign, has expired or reached a delivery cap.
+  def check_and_handle_delivery_limits
+    return unless approved? && delivery_limit_reached?
 
     update_column(:approved, false)
     if current_markdown_has_liquid_tag?
